@@ -1,28 +1,62 @@
-import numpy as np
 import tensorflow as tf
+import numpy as np
 from tensorflow import keras
 from tensorflow.keras import layers
 from keras.utils.np_utils import to_categorical
 import matplotlib.pyplot as plt
 import math
+import gc
+import os
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
+##########
+tf.config.experimental.set_lms_enabled(True)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.list_logical_devices('GPU')
+        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+    except RuntimeError as e:
+        # Memory growth must be set before GPUs have been initialized
+        print(e)
 
 
+#########
 def get_model():
     # network model
     model = keras.Sequential()
-    model.add(layers.Conv2D(1, (3, 3), activation='relu', input_shape=(32, 32, 3)))
-    # model.add(layers.Dropout(0.5))
-    # model.add(layers.Conv2D(64, (3, 3), activation='relu', kernel_initializer=tf.keras.initializers.HeUniform(),
-    #                         use_bias=True, bias_initializer=tf.keras.initializers.Ones(),
-    #                         kernel_regularizer=tf.keras.regularizers.l2(0.001)))
-    # model.add(layers.Dropout(0.5))
-    # model.add(layers.MaxPooling2D((2, 2)))
+    model.add(layers.Conv2D(32, (3, 3), activation='relu', use_bias=True, input_shape=(32, 32, 3)))
+    model.add(layers.Dropout(0.5))
+    model.add(layers.Conv2D(64, (3, 3), activation='relu', use_bias=True))
+    model.add(layers.Dropout(0.5))
+    model.add(layers.MaxPooling2D((2, 2)))
     model.add(layers.Flatten())
-    # model.add(layers.Dense(128, use_bias=True, bias_initializer=tf.keras.initializers.Ones(),
-    #                        kernel_regularizer=tf.keras.regularizers.l2(0.001), activation='tanh'))
-    # model.add(layers.Dropout(0.5))
-    model.add(layers.Dense(10, activation='softmax'))
+    model.add(layers.Dense(128, use_bias=True, activation='tanh'))
+    model.add(layers.Dropout(0.5))
+    model.add(layers.Dense(10, use_bias=True, activation='softmax'))
     return model
+
+
+def awgn(SNRdB, model, inject_to_weights):
+    # convert to snr
+    temp = SNRdB / 10
+    snr = 10 ** temp
+    var_noises = []
+    for layer in model.trainable_weights:
+        n = np.random.standard_normal(layer.shape)
+        es = tf.math.reduce_sum(layer ** 2)
+        en = tf.math.reduce_sum(n ** 2)
+        dim = tf.cast((snr * en), tf.float32)
+        alpha = tf.sqrt(es / dim)
+        if inject_to_weights:
+            layer.assign_add(alpha * n)
+        var = tf.math.reduce_variance(alpha * n)
+        var_noises.append(var)
+    return var_noises
 
 
 def create_plot(d, label):
@@ -41,12 +75,6 @@ def create_plot_y(data_x, data_y, label):
     plt.plot(data_x, data_y, label=label)
 
 
-def create_dataset(d, labels, batch_size):
-    dataset = tf.data.Dataset.from_tensor_slices((d, labels))
-    dataset = dataset.shuffle(buffer_size=1024).batch(batch_size)
-    return dataset
-
-
 class SNR:
     def set(self, value):
         self.value = value
@@ -57,221 +85,132 @@ class SNR:
 def add_snr(list_snr, value, accuracy, loss):
     for i in list_snr:
         if i.value == value:
-            i.accuracy=(accuracy)
-            i.loss=(loss)
+            i.accuracy = (accuracy)
+            i.loss = (loss)
     return list_snr
 
 
-def get_snr_acc(list_snr, value):
-    for i in list_snr:
-        if i.value == value:
-            return i.accuracy
-
-def get_snr_loss(list_snr, value):
-    for i in list_snr:
-        if i.value == value:
-            return i.loss
-
-
-def awgn(SNRdB, model, inject_to_weights):
-    # convert to snr
-    temp = SNRdB / 10
-    snr = 10 ** temp
-    var_noises = []
-    for layer in model.trainable_weights:
-        n = np.random.standard_normal(layer.shape)
-        es = np.sum(layer ** 2)
-        en = np.sum(n ** 2)
-        alpha = np.sqrt(es / (snr * en))
-        if inject_to_weights:
-            layer.assign_add(alpha * n)
-        var_noises.append(np.var(alpha * n))
-    return var_noises
-
-
-class MySGDOptimizer(keras.optimizers.Optimizer):
-    def __init__(self, learning_rate=0.001, name="MySGDOptimizer", **kwargs):
-        super().__init__(name, **kwargs)
-        self._set_hyper("learning_rate", kwargs.get("lr", learning_rate))
-
-    def _create_slots(self, var_list):
-        for var in var_list:
-            self.add_slot(var, "m")
-
-    @tf.function
-    def _resource_apply_dense(self, grad, var):
-        """Update the slots and perform one optimization step for one model variable
-        """
-        var_dtype = var.dtype.base_dtype
-        lr_t = self._decayed_lr(var_dtype)  # handle learning rate decay
-        #         momentum_var = self.get_slot(var, "momentum")
-        #         momentum_hyper = self._get_hyper("momentum", var_dtype)
-        #         momentum_var.assign(momentum_var * momentum_hyper - (1. - momentum_hyper)* grad)
-
-        var.assign(var)
-
-    def _resource_apply_sparse(self, grad, var):
-        raise NotImplementedError
-
-    def get_config(self):
-        base_config = super().get_config()
-        return {
-            **base_config
-        }
+def train_step(inputs):
+    images, labels = inputs
+    new_weights = []
+    var_noises = awgn(snr_current, model_taylor, False)
+    mu = 0.01
+    with tf.GradientTape(persistent=True) as tape2:
+        with tf.GradientTape() as tape1:
+            predictions = model_taylor(images, training=True)
+            loss = compute_loss(labels, predictions)
+        grads = tape1.gradient(loss, model_taylor.trainable_weights)
+    for idx, val in enumerate(grads):
+        h = tape2.jacobian(val, model_taylor.trainable_weights[idx], experimental_use_pfor=False)
+        # updating weights based on taylor expansion
+        # w^k=w^(k-1)-μ[∇_w l(B;w)+1/2 σ^2 ∇_w^2 l(B;w) ∇_w l(B;w)]
+        # reshaping for matrix multiplication
+        h_linear = tf.reshape(h, [-1])
+        d_h_linear = math.sqrt(h_linear.shape.as_list()[0])
+        h_reshape = tf.reshape(h, [np.int(d_h_linear), np.int(d_h_linear)])
+        val_linear = tf.reshape(val, [-1])
+        d_val_linear = val_linear.shape.as_list()[0]
+        val_reshape = tf.reshape(val, [d_val_linear, 1])
+        matmul = tf.matmul(h_reshape, val_reshape)
+        temp = val + 1 / 2 * tf.cast(var_noises[idx], tf.float32) * tf.reshape(matmul, val.shape)
+        new_weights.append(tf.convert_to_tensor(model_taylor.trainable_weights[idx] - mu * temp))
+    train_accuracy.update_state(labels, predictions)
+    return new_weights,loss
 
 
-class Taylorcallback(keras.callbacks.Callback):
-    def __init__(self, model, snr):
-        super(Taylorcallback, self).__init__()
-        self.model = model
-        self.snr = snr
+def test_step(inputs):
+    images, labels = inputs
 
-    def on_epoch_end(self, epoch, logs=None):
-        print("Training accuracy taylor over epoch: %d : %.4f" % (epoch, float(logs["categorical_accuracy"]),))
+    predictions = model_taylor(images, training=False)
+    t_loss = loss_object(labels, predictions)
 
-    def on_train_batch_begin(self, batch, logs=None):
-        print("on_train_batch_begin")
-        mu = 0.001
-        new_weights = []
-        var_noises = awgn(self.snr, self.model, False)
-        with tf.GradientTape(persistent=True) as tape2:
-            with tf.GradientTape() as tape1:
-                logits = self.model(data_list[batch][0], training=True)
-                loss_value = loss_fn(data_list[batch][1], logits)
-                if math.isnan(loss_value):
-                    print("loss is nan")
-            grads = tape1.gradient(loss_value, self.model.trainable_weights)
-        for idx, val in enumerate(grads):
-            h = tape2.jacobian(val, self.model.trainable_weights[idx], experimental_use_pfor=False)
-            var_noise = var_noises[idx]
-            # updating weights based on taylor expansion
-            # w^k=w^(k-1)-μ[∇_w l(B;w)+1/2 σ^2 ∇_w^2 l(B;w) ∇_w l(B;w)]
-            # reshaping for matrix multiplication
-            h_linear = np.reshape(h, [-1])
-            d_h_linear = np.sqrt(h_linear.shape)
-            h_reshape = np.reshape(h, (np.int(d_h_linear[0]), np.int(d_h_linear[0])))
-            val_linear = np.reshape(val, [-1])
-            d_val_linear = val_linear.shape
-            val_reshape = np.reshape(val, (np.int(np.array(d_val_linear)[0])))
-            matmul = np.matmul(h_reshape, val_reshape)
-            temp = np.array(val, dtype=np.float64) + 1 / 2 * var_noise * np.reshape(matmul, val.shape)
-            new_weights.append(self.model.trainable_weights[idx] - mu * temp)
-            if np.isnan(val).any():
-                print("grads is nan")
-            if np.isnan(h).any():
-                print("hessian is nan")
-        self.model.set_weights(new_weights)
+    test_loss.update_state(t_loss)
+    test_accuracy.update_state(labels, predictions)
 
-    def on_test_batch_begin(self, batch, logs=None):
-        awgn(self.snr, self.model, True);
-class Noiseawarecallback(keras.callbacks.Callback):
-    def __init__(self, model, snr):
-        super(Noiseawarecallback, self).__init__()
-        self.model = model
-        self.snr = snr
 
-    def on_epoch_end(self, epoch, logs=None):
-        print("Training accuracy SGD noise aware over epoch: %d : %.4f" % (epoch, float(logs["categorical_accuracy"]),))
+@tf.function
+def distributed_train_step(dataset_inputs):
+    w,per_replica_losses = strategy.experimental_run_v2(train_step, args=(dataset_inputs,))
+    w_total=[]
+    for per_replica_w in w:
+        w_new=strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica_w,
+                        axis=None)
+        w_total.append(w_new)
+    return w_total, strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
+                           axis=None)
 
-    def on_train_batch_begin(self, batch, logs=None):
-        awgn(self.snr, self.model, True)
 
-    def on_test_batch_begin(self, batch, logs=None):
-        awgn(self.snr, self.model, True);
-class Noiseunawarecallback(keras.callbacks.Callback):
-    def __init__(self, model, snr):
-        super(Noiseunawarecallback, self).__init__()
-        self.model = model
-        self.snr = snr
+@tf.function
+def distributed_test_step(dataset_inputs):
+    return strategy.experimental_run_v2(test_step, args=(dataset_inputs,))
 
-    def on_epoch_end(self, epoch, logs=None):
-        print("Training accuracy SGD over epoch: %d : %.4f" % (epoch, float(logs["categorical_accuracy"]),))
-    def on_test_batch_begin(self, batch, logs=None):
-        awgn(self.snr, self.model, True);
 
+#############
 (train_images, train_labels), (test_images, test_labels) = keras.datasets.cifar10.load_data()
-train_images, test_images = train_images / 255, test_images / 255
+train_images, test_images = train_images / np.float32(255), test_images / np.float32(255)
 
 y_train_one_hot = to_categorical(train_labels)
 y_test_one_hot = to_categorical(test_labels)
-#
-loss_fn = keras.losses.CategoricalCrossentropy(from_logits=False)
-batch_size = 64
-data = create_dataset(train_images[0:105], y_train_one_hot[0:105], batch_size)
-dataset_test = create_dataset(test_images[0:105], y_test_one_hot[0:105], batch_size)
-data_list = list(data)
-SNRs = [25]
-output_taylor = {}
-output_SGD_noise_aware = {}
-output_SGD_noise_unaware = {}
-output_taylor['test'] = []
-output_SGD_noise_aware['test'] = []
-output_SGD_noise_unaware['test'] = []
-#
-for snr in SNRs:
-    print("taylor is using for SNR " + str(snr))
-    a = SNR()
-    a.set(snr)
-    output_taylor['test'].append(a)
+SNRs = [5, 10, 15, 20, 25]
+strategy = tf.distribute.MirroredStrategy()
+BUFFER_SIZE = len(train_images)
+BATCH_SIZE_PER_REPLICA = 64
+GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
+EPOCHS = 50
+train_dataset = tf.data.Dataset.from_tensor_slices((train_images, y_train_one_hot)).shuffle(BUFFER_SIZE).batch(
+    GLOBAL_BATCH_SIZE)
+test_dataset = tf.data.Dataset.from_tensor_slices((test_images, y_test_one_hot)).batch(GLOBAL_BATCH_SIZE)
+
+train_dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
+test_dist_dataset = strategy.experimental_distribute_dataset(test_dataset)
+
+with strategy.scope():
+    loss_object = tf.keras.losses.CategoricalCrossentropy(
+        from_logits=True,
+        reduction=tf.keras.losses.Reduction.NONE)
+
+
+    def compute_loss(labels, predictions):
+        per_example_loss = loss_object(labels, predictions)
+        return tf.nn.compute_average_loss(per_example_loss, global_batch_size=GLOBAL_BATCH_SIZE)
+
+with strategy.scope():
+    test_loss = tf.keras.metrics.Mean(name='test_loss')
+
+    train_accuracy = tf.keras.metrics.CategoricalAccuracy(
+        name='train_accuracy')
+    test_accuracy = tf.keras.metrics.CategoricalAccuracy(
+        name='test_accuracy')
+
+with strategy.scope():
     model_taylor = get_model()
-    model_taylor.compile(loss="categorical_crossentropy", optimizer=MySGDOptimizer(), metrics=["categorical_accuracy"])
-    model_taylor.fit(train_images[0:105], y_train_one_hot[0:105], epochs=1, batch_size=batch_size,validation_split=0.3,
-                     callbacks=[Taylorcallback(model_taylor, snr), tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=4, verbose=0,mode='min')])
-    #end of taylor training
-    #test
-    loss, acc = model_taylor.evaluate(test_images[0:105], y_test_one_hot[0:105],verbose=0, batch_size=batch_size,callbacks=[Taylorcallback(model_taylor, snr)])
-    add_snr(output_taylor['test'], snr, acc, loss);
-###########################################################
+
+print("number of replicas " + str(strategy.num_replicas_in_sync))
 for snr in SNRs:
-    print("SGD noise aware is using for SNR " + str(snr))
-    a = SNR()
-    a.set(snr)
-    output_SGD_noise_aware['test'].append(a)
-    model_SGD_noise_aware = get_model()
-    model_SGD_noise_aware.compile(loss="categorical_crossentropy", optimizer="SGD", metrics=["categorical_accuracy"])
-    model_SGD_noise_aware.fit(train_images[0:105], y_train_one_hot[0:105], epochs=1, batch_size=batch_size,validation_split=0.3,
-                     callbacks=[Noiseawarecallback(model_SGD_noise_aware, snr), tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=4, verbose=0,mode='min')])
-    #end of taylor training
-    #test
-    loss, acc = model_SGD_noise_aware.evaluate(test_images[0:105], y_test_one_hot[0:105],verbose=0, batch_size=batch_size,callbacks=[Noiseawarecallback(model_SGD_noise_aware, snr)])
-    add_snr(output_SGD_noise_aware['test'], snr, acc, loss);
-##########################################################
-for snr in SNRs:
-    print("SGD noise unaware is using for SNR " + str(snr))
-    a = SNR()
-    a.set(snr)
-    output_SGD_noise_unaware['test'].append(a)
-    model_SGD_noise_unaware = get_model()
-    model_SGD_noise_unaware.compile(loss="categorical_crossentropy", optimizer="SGD", metrics=["categorical_accuracy"])
-    model_SGD_noise_unaware.fit(train_images[0:105], y_train_one_hot[0:105], epochs=1, batch_size=batch_size,validation_split=0.3,
-                     callbacks=[Noiseunawarecallback(model_SGD_noise_unaware, snr)])
-    #end of taylor training
-    #test
-    loss, acc = model_SGD_noise_unaware.evaluate(test_images[0:105], y_test_one_hot[0:105],verbose=0, batch_size=batch_size,callbacks=[Noiseunawarecallback(model_SGD_noise_unaware, snr), tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=4, verbose=0,mode='min')])
-    add_snr(output_SGD_noise_unaware['test'], snr, acc, loss);
-################
-#figures
-loss_taylor = [];
-acc_taylor = [];
-loss_noise_unaware = [];
-acc_noise_unaware = [];
-loss_noise_aware = [];
-acc_noise_aware = [];
-for snr in SNRs:
-    loss_taylor.append(get_snr_loss(output_taylor["test"], snr));
-    acc_taylor.append(get_snr_acc(output_taylor["test"], snr));
-for snr in SNRs:
-    loss_noise_unaware.append(get_snr_loss(output_SGD_noise_unaware["test"], snr));
-    acc_noise_unaware.append(get_snr_acc(output_SGD_noise_unaware["test"], snr));
-for snr in SNRs:
-    loss_noise_aware.append(get_snr_loss(output_SGD_noise_aware["test"], snr));
-    acc_noise_aware.append(get_snr_acc(output_SGD_noise_aware["test"], snr));
-create_plot_y(SNRs, acc_taylor, "Accuracy while using taylor expansion")
-create_plot_y(SNRs, acc_noise_aware, "Accuracy while using SGD and noise")
-create_plot_y(SNRs, acc_noise_unaware, "Accuracy while using SGD and no noise")
-display_plot("Comparison of accuracy", "SNR", "Accuracy")
-create_plot_y(SNRs, loss_taylor, "Loss while using taylor expansion")
-create_plot_y(SNRs, loss_noise_aware, "Loss while using SGD and noise")
-create_plot_y(SNRs, loss_noise_unaware, "Loss while using SGD and no noise")
-display_plot("Comparison of loss", "SNR", "Loss")
-#pip install pyqt5
+    snr_current = snr
+    for epoch in range(EPOCHS):
+        total_loss = 0.0
+        total_w = []
+        num_batches = 0
+        for x in train_dist_dataset:
+            new_weights = [];
+            w_total,l = distributed_train_step(x)
+            total_loss += l
+            model_taylor.set_weights(w_total)
+            print("set weight is done for batch "+str(num_batches))
+            num_batches += 1
+        train_loss = total_loss / num_batches
+        train_accuracy.reset_states()
+
+        # TEST LOOP
+    for x in test_dist_dataset:
+        distributed_test_step(x)
+    template = ("Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, "
+                "Test Accuracy: {}")
+    print(template.format(epoch + 1, train_loss,
+                          train_accuracy.result() * 100, test_loss.result(),
+                          test_accuracy.result() * 100))
+
+    test_loss.reset_states()
+    train_accuracy.reset_states()
+    test_accuracy.reset_states()
